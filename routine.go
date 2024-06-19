@@ -372,7 +372,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			PingTimestampUnix: now.Unix(),
 			PingTimestampDT:   now.Sub(now).String(),
 		}
-		body, err := json.Marshal(d.PingRecord)
+		body, err := json.MarshalIndent(d.PingRecord, " ", " ")
 		defer d.PingLock.Unlock()
 
 		if err != nil {
@@ -425,8 +425,6 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d VirtualTun) pingIPs() {
-	// TODO: add timeout
-	// TODO: protect the map
 	for _, addr := range d.Conf.CheckAlive {
 		start := time.Now()
 		socket, err := d.Tnet.Dial("ping", addr.String())
