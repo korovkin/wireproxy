@@ -8,10 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"golang.org/x/net/icmp"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/net/ipv6"
-	"golang.zx2c4.com/wireguard/device"
 	"io"
 	"log"
 	"math/rand"
@@ -21,7 +17,13 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/device"
 
 	"github.com/sourcegraph/conc"
 	"github.com/things-go/go-socks5"
@@ -33,12 +35,22 @@ import (
 )
 
 // errorLogger is the logger to print error message
-var errorLogger = log.New(os.Stderr, "ERROR: ", log.LstdFlags)
+var errorLogger = log.New(os.Stderr, "ERROR: ", log.LstdFlags|log.Lmicroseconds|log.Lshortfile)
 
 // CredentialValidator stores the authentication data of a socks5 proxy
 type CredentialValidator struct {
 	username string
 	password string
+}
+
+type PingRecordValue struct {
+	// has the ping ever worked:
+	PingOK bool `json:"ok"`
+
+	// last pign:
+	PingTimestampUnix int64     `json:"ping_ts_unix"`
+	PingTimestampDT   string    `json:"ping_dt"`
+	PingTimestamp     time.Time `json:"ping_ts"`
 }
 
 // VirtualTun stores a reference to netstack network and DNS configuration
@@ -48,7 +60,8 @@ type VirtualTun struct {
 	SystemDNS bool
 	Conf      *DeviceConfig
 	// PingRecord stores the last time an IP was pinged
-	PingRecord map[string]uint64
+	PingLock   *sync.Mutex
+	PingRecord map[string]PingRecordValue
 }
 
 // RoutineSpawner spawns a routine (e.g. socks5, tcp static routes) after the configuration is parsed
@@ -351,7 +364,17 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Health metric request: %s\n", r.URL.Path)
 	switch path.Clean(r.URL.Path) {
 	case "/readyz":
+		now := time.Now()
+		d.PingLock.Lock()
+		d.PingRecord["localhost/readyz"] = PingRecordValue{
+			PingOK:            true,
+			PingTimestamp:     now,
+			PingTimestampUnix: now.Unix(),
+			PingTimestampDT:   now.Sub(now).String(),
+		}
 		body, err := json.Marshal(d.PingRecord)
+		defer d.PingLock.Unlock()
+
 		if err != nil {
 			errorLogger.Printf("Failed to get device metrics: %s\n", err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -360,9 +383,8 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		status := http.StatusOK
 		for _, record := range d.PingRecord {
-			lastPong := time.Unix(int64(record), 0)
 			// +2 seconds to account for the time it takes to ping the IP
-			if time.Since(lastPong) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
+			if time.Since(record.PingTimestamp) > time.Duration(d.Conf.CheckAliveInterval+2)*time.Second {
 				status = http.StatusServiceUnavailable
 				break
 			}
@@ -371,6 +393,7 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 		_, _ = w.Write([]byte("\n"))
+
 	case "/metrics":
 		get, err := d.Dev.IpcGet()
 		if err != nil {
@@ -402,7 +425,10 @@ func (d VirtualTun) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d VirtualTun) pingIPs() {
+	// TODO: add timeout
+	// TODO: protect the map
 	for _, addr := range d.Conf.CheckAlive {
+		start := time.Now()
 		socket, err := d.Tnet.Dial("ping", addr.String())
 		if err != nil {
 			errorLogger.Printf("Failed to ping %s: %s\n", addr, err.Error())
@@ -436,6 +462,8 @@ func (d VirtualTun) pingIPs() {
 
 		addr := addr
 		go func() {
+			defer socket.Close()
+
 			n, err := socket.Read(icmpBytes[:])
 			if err != nil {
 				errorLogger.Printf("Failed to read ping response from %s: %s\n", addr, err.Error())
@@ -475,16 +503,28 @@ func (d VirtualTun) pingIPs() {
 				}
 			}
 
-			d.PingRecord[addr.String()] = uint64(time.Now().Unix())
+			now := time.Now()
+			addrString := addr.String()
 
-			defer socket.Close()
+			{
+				d.PingLock.Lock()
+				defer d.PingLock.Unlock()
+
+				d.PingRecord[addrString] = PingRecordValue{
+					PingOK:            true,
+					PingTimestamp:     now,
+					PingTimestampUnix: now.Unix(),
+					PingTimestampDT:   now.Sub(start).String(),
+				}
+			}
 		}()
 	}
 }
 
 func (d VirtualTun) StartPingIPs() {
 	for _, addr := range d.Conf.CheckAlive {
-		d.PingRecord[addr.String()] = 0
+		addrString := addr.String()
+		d.PingRecord[addrString] = PingRecordValue{}
 	}
 
 	go func() {
